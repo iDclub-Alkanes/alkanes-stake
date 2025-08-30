@@ -1,0 +1,22 @@
+[package]
+name = "alkanes_stake"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs",tag = "v1.0.1"}
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs",tag = "v1.0.1"}
+metashrew-support = { git = "https://github.com/sandshrewmetaprotocols/metashrew" }
+anyhow = "1.0.98"
+
+[dev-dependencies]
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v1.0.1", features = ["test-utils"] }
+
+[build-dependencies]
+anyhow = "1.0.90"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["console"] }
