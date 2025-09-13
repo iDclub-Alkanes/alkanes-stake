@@ -16,7 +16,8 @@ use alkanes_support::{
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
-const COLLECTION_SYMBOL: &str = "SLP";
+const COLLECTION_NAME: &str = "LP Staking";
+const COLLECTION_SYMBOL: &str = "LPS";
 
 #[derive(Default)]
 pub struct StakingVault(());
@@ -66,8 +67,7 @@ enum StakingVaultMessage {
 
 impl Token for StakingVault {
     fn name(&self) -> String {
-        let collection_name = self.get_collection_name();
-        format!("{} #{}", collection_name, self.index())
+        format!("{} #{}", COLLECTION_NAME, self.index())
     }
 
     fn symbol(&self) -> String {
@@ -240,21 +240,6 @@ impl StakingVault {
         AlkaneId {
             block: u128::from_le_bytes(bytes[0..16].try_into().unwrap()),
             tx: u128::from_le_bytes(bytes[16..32].try_into().unwrap()),
-        }
-    }
-
-    fn get_collection_name(&self) -> String {
-        let collection_id = self.collection_ref();
-        let cellpack = Cellpack {
-            target: collection_id,
-            inputs: vec![99],  // opcode 99 for GetName
-        };
-
-        match self.staticcall(&cellpack, &AlkaneTransferParcel::default(), self.fuel()) {
-            Ok(call_response) => {
-                String::from_utf8(call_response.data).unwrap_or_else(|_| "Unknown".to_string())
-            }
-            Err(_) => "Unknown".to_string()
         }
     }
 

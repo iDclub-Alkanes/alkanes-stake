@@ -16,6 +16,9 @@ use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
 const COLLECTION_SYMBOL: &str = "SLP";
+// Number of blocks in the claim window after the staking period ends.
+// 7 days on Alkanes: 144 blocks/day * 7 days = 1008 blocks.
+const CLAIM_WINDOW_BLOCKS: u64 = 144 * 7; // 1008
 static COLLECTION_IMAGE: &[u8] = include_bytes!("assets/vault.png");
 
 #[derive(Default)]
@@ -124,6 +127,7 @@ impl StakingPool {
         self.set_staking_count(0);
         self.set_total_stake_blocks(0);
         self.set_total_stake_amount(0);
+        self.set_total_stake_weight(0);
 
         let mut response = CallResponse::forward(&invalid_alkanes);
         response.alkanes.0.push(AlkaneTransfer {
@@ -189,6 +193,11 @@ impl StakingPool {
         let total_stake_amount = self.get_total_stake_amount();
         self.set_total_stake_amount(total_stake_amount + total_amount);
         
+        // Update total staking weight (sum of user_amount * user_blocks)
+        let user_weight = stake_blocks.saturating_mul(total_amount);
+        let total_weight = self.get_total_stake_weight();
+        self.set_total_stake_weight(total_weight.saturating_add(user_weight));
+        
         let mut response = CallResponse::forward(&invalid_alkanes);
         if sub_response.alkanes.0.is_empty() {
             Err(anyhow!("Failed to create staking position"))
@@ -211,26 +220,28 @@ impl StakingPool {
         let end_height = self.get_end_height();
         let current_height = self.height();
 
-        // Expired, normal reward extraction
+        // Staking period ended: allow reward claims within the claim window
         if current_height >= end_height {
             // Check if within 7-day (1008 blocks) claim period
-            let claim_deadline = end_height + 1008;
+            let claim_deadline = end_height + CLAIM_WINDOW_BLOCKS;
             if current_height < claim_deadline {
-                let reward_value = self.calc_reward(&context.caller);
-                if reward_value > 0 {
+                // Single-claim model: Unstake burns the voucher; pay full entitlement once.
+                let total_reward_value = self.calc_reward(&context.caller);
+                if total_reward_value > 0 {
                     response.alkanes.0.push(AlkaneTransfer {
                         id: self.get_reward_token_id(),
-                        value: reward_value,
+                        value: total_reward_value,
                     });
 
-                    // Store user's claimed reward amount
-                    self.set_user_claimed_reward(&context.caller, reward_value);
+                    // Record the claimed amount for reporting via get_attributes.
+                    self.set_user_claimed_reward(&context.caller, total_reward_value);
                 }
             }
 
-            // Reward data cannot be cleared, used for other stakers' reward calculation
+            // Note: We do not clear per-user staking data here because
+            // total distribution references historical weights for correctness.
         }
-        // Not expired, early withdrawal without rewards
+        // Staking not yet ended: early withdrawal without rewards
         else {
             // Deduct current staking amount from total, redistribute rewards to other stakers
             let user_stake_blocks = self.get_stake_blocks(&context.caller);
@@ -239,6 +250,11 @@ impl StakingPool {
 
             let total_stake_amount = self.get_total_stake_amount();
             self.set_total_stake_amount(total_stake_amount.saturating_sub(user_stake_amount));
+
+            // Deduct user's weight from total staking weight
+            let user_weight = user_stake_blocks.saturating_mul(user_stake_amount);
+            let total_weight = self.get_total_stake_weight();
+            self.set_total_stake_weight(total_weight.saturating_sub(user_weight));
         }
 
         response.data = self.get_staking_token_id().try_into()?;
@@ -250,7 +266,9 @@ impl StakingPool {
 
         let end_height = self.get_end_height();
         let current_height = self.height();
-        let claim_deadline = end_height + 1008;
+        // Owner can withdraw unclaimed rewards only after the claim window.
+        // Prior to that, users must have a chance to claim.
+        let claim_deadline = end_height + CLAIM_WINDOW_BLOCKS;
         if current_height < claim_deadline {
             return Err(anyhow!("Hold on, the user is claiming rewards."));
         }
@@ -259,6 +277,7 @@ impl StakingPool {
         let mut response = CallResponse::forward(&context.incoming_alkanes);
 
         let reward_token = self.get_reward_token_id();
+        // Transfer all remaining reward tokens in the pool back to the owner.
         response.alkanes.0.push(AlkaneTransfer {
             id: reward_token,
             value: self.balance(&context.myself, &reward_token)
@@ -274,10 +293,8 @@ impl StakingPool {
             return 0;
         }
 
-        // System total weight = total staking amount × total staking blocks
-        let total_stake_amount = self.get_total_stake_amount();
-        let total_stake_blocks = self.get_total_stake_blocks();
-        let total_weight = total_stake_blocks * total_stake_amount;
+        // System total weight = sum of (amount × blocks) across all users
+        let total_weight = self.get_total_stake_weight();
 
         // Calculate user weight: staking amount × staking blocks
         let user_weight = user_stake_blocks * user_stake_amount;
@@ -286,7 +303,9 @@ impl StakingPool {
         // Reward = total reward pool × (user weight / total weight)
         let total_reward_amount = self.get_total_reward_amount();
         match user_weight.checked_mul(total_reward_amount) {
-            Some(product) => product.checked_div(total_weight).unwrap_or_else(|| 0),
+            Some(product) => {
+                if total_weight == 0 { 0 } else { product.checked_div(total_weight).unwrap_or(0) }
+            }
             None => 0,
         }
     }
@@ -528,6 +547,19 @@ impl StakingPool {
         self.total_reward_amount_pointer().set_value::<u128>(amount);
     }
 
+    // Total staking weight: sum of (user_stake_amount × user_stake_blocks)
+    fn total_stake_weight_pointer(&self) -> StoragePointer {
+        StoragePointer::from_keyword("/total_stake_weight")
+    }
+
+    fn get_total_stake_weight(&self) -> u128 {
+        self.total_stake_weight_pointer().get_value::<u128>()
+    }
+
+    fn set_total_stake_weight(&self, weight: u128) {
+        self.total_stake_weight_pointer().set_value::<u128>(weight);
+    }
+
     fn user_claimed_reward_pointer(&self, alkane_id: &AlkaneId) -> StoragePointer {
         StoragePointer::from_keyword(
             format!("/user_claimed_reward/{}:{}", alkane_id.block, alkane_id.tx).as_str(),
@@ -607,39 +639,17 @@ impl StakingPool {
             return Ok(response)
         }
         
-        // Calculate total reward that can be mined
+        // Calculate total reward that can be mined (user's full entitlement)
         let total_reward = self.calc_reward(&context.caller);
-        
-        // Calculate mined reward (based on user's staking blocks)
-        let current_height = self.height() as u128;
 
-        let mined_reward = if current_height < end_height {
-            // Calculate mined blocks from staking start to current block
-            let mined_blocks = if current_height > stake_block {
-                current_height - stake_block
-            } else {
-                0
-            };
-            
-            // Calculate user's total staking blocks (from staking start to mining end)
-            let total_stake_blocks = end_height - stake_block;
-            
-            if mined_blocks > 0 && total_stake_blocks > 0 {
-                (total_reward * mined_blocks) / total_stake_blocks
-            } else {
-                0
-            }
-        } else {
-            // Mining ended, all rewards have been mined
-            total_reward
-        };
-        
-        // Get whether user has claimed rewards
+        // Get whether user has claimed rewards (omit mined progress since current height
+        // is unavailable/restricted in this execution context)
         let claimed_reward = self.get_user_claimed_reward(&context.caller);
+        let stake_blocks = self.get_stake_blocks(&context.caller);
         
         let stake_info = format!(
-            r#"{{"stake_block":{},"stake_amount":"{}","total_reward":"{}","mined_reward":"{}","claimed_reward":"{}"}}"#,
-            stake_block, stake_amount, total_reward, mined_reward, claimed_reward
+            r#"{{"stake_block":{},"stake_amount":"{}","stake_blocks":"{}","total_reward":"{}","claimed_reward":"{}"}}"#,
+            stake_block, stake_amount, stake_blocks, total_reward, claimed_reward
         );
         response.data = stake_info.into_bytes();
         Ok(response)
